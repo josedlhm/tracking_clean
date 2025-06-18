@@ -6,8 +6,37 @@ Reusable helper functions for the 3D fruit-tracking pipeline.
 
 import numpy as np
 from sklearn.cluster import DBSCAN
-FX, FY = 1272.44, 1272.67
-CX, CY =  920.062, 618.949
+from scipy.spatial.transform import Rotation as SciRot
+
+
+def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
+    """
+    Uniformly downsample 3D points by voxel grid average.
+    """
+    if points.size == 0:
+        return points
+    coords = np.floor(points / voxel_size).astype(np.int32)
+    unique, inverse = np.unique(coords, axis=0, return_inverse=True)
+    down = np.zeros((len(unique), 3), dtype=np.float32)
+    for i in range(len(unique)):
+        down[i] = points[inverse == i].mean(axis=0)
+    return down
+
+def world_to_camera(points_w: np.ndarray, T_wc: np.ndarray) -> np.ndarray:
+    """
+    Transform world points into camera frame.
+    """
+    T_cw = np.linalg.inv(T_wc)
+    R_cw, t_cw = T_cw[:3, :3], T_cw[:3, 3]
+    return (R_cw @ points_w.T).T + t_cw
+
+def rotation_matrix_to_angle_axis(R: np.ndarray) -> np.ndarray:
+    """
+    Convert a 3x3 rotation matrix to an angle-axis (rotvec) vector.
+    """
+    return SciRot.from_matrix(R).as_rotvec()
+
+
 
 def load_poses(path):
     """

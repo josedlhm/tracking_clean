@@ -1,129 +1,103 @@
-#!/usr/bin/env python3
+from pathlib import Path
 import json
 import numpy as np
-from pathlib import Path
 from sklearn.cluster import DBSCAN
+from typing import List, Tuple, Dict, Any
+from track_utils import load_poses, world_to_camera, voxel_downsample
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-TRACKS_JSON = Path("output/tracks.json")
-POSES_FILE = Path("data/poses/poses_mm_yup.txt")
-OUTPUT_JSON = Path("output/tracks_cleaned.json")
+def run(
+    tracks_json: Path,
+    poses_file:  Path,
+    output_json: Path,
+    voxel_size:  float = 5.0,
+    eps:         float = 60.0,
+    min_samples: int   = 10
+) -> Path:
+    """
+    Clean and flag 3D tracks via DBSCAN.
+    Returns path to cleaned tracks JSON.
+    """
+    poses = load_poses(poses_file)
+    with open(tracks_json, 'r') as f:
+        raw_tracks: Dict[str, List[Dict[str, Any]]] = json.load(f)
 
-# ─── INTRINSICS ───────────────────────────────────────────────────────────────
-FX, FY = 1272.44, 1272.67
-CX, CY = 920.062, 618.949
+    new_tracks: Dict[str, Any] = {}
+    flagged: List[Tuple[str, int, int]] = []
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-def load_poses(path):
-    Ts = []
-    with open(path, 'r') as f:
-        for line in f:
-            vals = list(map(float, line.strip().split()))
-            R = np.array([vals[0:3], vals[4:7], vals[8:11]])
-            t = np.array([vals[3], vals[7], vals[11]])
-            T = np.eye(4)
-            T[:3, :3] = R
-            T[:3, 3] = t
-            Ts.append(T)
-    return Ts
+    for tid, dets in raw_tracks.items():
+        all_pts = []
+        meta: List[Tuple[Dict[str, Any], np.ndarray]] = []
 
-def world_to_camera(points_world, T_wc):
-    T_cw = np.linalg.inv(T_wc)
-    R_cw, t_cw = T_cw[:3, :3], T_cw[:3, 3]
-    return (R_cw @ points_world.T).T + t_cw
+        for d in dets:
+            pts = np.array(d.get("mask_points_3d", []), dtype=float)
+            if pts.size:
+                all_pts.append(pts)
+                meta.append((d, pts))
 
-def voxel_downsample(points, voxel_size=5):
-    if len(points) == 0:
-        return points
-    coords = np.floor(points / voxel_size).astype(np.int32)
-    unique, inverse = np.unique(coords, axis=0, return_inverse=True)
-    down_pts = np.zeros((len(unique), 3), dtype=np.float32)
-    for i in range(len(unique)):
-        down_pts[i] = points[inverse == i].mean(axis=0)
-    return down_pts
-
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-def main():
-    poses = load_poses(POSES_FILE)
-    with open(TRACKS_JSON) as f:
-        tracks = json.load(f)
-
-    new_tracks = {}
-    flagged = []
-
-    for tid, detections in tracks.items():
-        all_pts_world = []
-        detection_meta = []
-
-        for d in detections:
-            if "mask_points_3d" in d:
-                pts_world = np.array(d["mask_points_3d"])
-                if pts_world.shape[0] > 0:
-                    all_pts_world.append(pts_world)
-                    detection_meta.append((d, pts_world))
-
-        if not all_pts_world:
+        if not all_pts:
             continue
 
-        all_pts_world = np.vstack(all_pts_world)
-        if all_pts_world.shape[0] < 10:
-            new_tracks[tid] = detections
+        stacked = np.vstack(all_pts)
+        if stacked.shape[0] < 10:
+            new_tracks[tid] = dets
             continue
 
-        all_pts_world = voxel_downsample(all_pts_world, voxel_size=5)
-        db = DBSCAN(eps=60, min_samples=10)
-        labels = db.fit_predict(all_pts_world)
+        down = voxel_downsample(stacked, voxel_size)
+        db = DBSCAN(eps=eps, min_samples=min_samples)
+        labels = db.fit_predict(down)
 
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         if n_clusters > 1:
-            flagged.append((tid, n_clusters, len(all_pts_world)))
+            flagged.append((tid, n_clusters, down.shape[0]))
 
         if np.max(labels) < 0 or n_clusters <= 1:
-            new_tracks[tid] = detections
+            new_tracks[tid] = dets
             continue
 
-        # Compute cluster centers
-        cluster_means = {}
-        for lbl in np.unique(labels[labels >= 0]):
-            cluster_pts = all_pts_world[labels == lbl]
-            cluster_means[lbl] = cluster_pts.mean(axis=0)
+        # compute cluster means
+        means = {lbl: down[labels == lbl].mean(axis=0)
+                 for lbl in set(labels) if lbl >= 0}
 
-        # Assign detections to nearest cluster mean
-        cluster_to_dets = {}
-        for d, pts in detection_meta:
-            centroid = pts.mean(axis=0)
-            best_lbl = min(cluster_means, key=lambda l: np.linalg.norm(centroid - cluster_means[l]))
-            cluster_to_dets.setdefault(best_lbl, []).append(d)
+        # assign each detection to nearest cluster
+        clusters: Dict[int, List[Dict[str, Any]]] = {}
+        for d, pts in meta:
+            center = pts.mean(axis=0)
+            best = min(means, key=lambda l: np.linalg.norm(center - means[l]))
+            clusters.setdefault(best, []).append(d)
 
-        # Select best cluster
+        # choose cluster with closest mean Z
         best_lbl = None
-        best_z = float("inf")
-        for lbl, dets in cluster_to_dets.items():
-            if len(dets) >= 4:
-                frame = dets[0]["frame"]
-                cam_pts = world_to_camera(np.array([d["centroid_3d"] for d in dets]), poses[frame])
-                z_mean = cam_pts[:, 2].mean()
-                if z_mean < best_z:
-                    best_z = z_mean
-                    best_lbl = lbl
+        best_z = float('inf')
+        for lbl, group in clusters.items():
+            if len(group) >= min_samples:
+                frame0 = group[0]["frame"]
+                pts_cam = world_to_camera(
+                    np.vstack([g.get("centroid_3d", [0,0,0]) for g in group]),
+                    poses[frame0]
+                )
+                zmean = pts_cam[:, 2].mean()
+                if zmean < best_z:
+                    best_z, best_lbl = zmean, lbl
 
         if best_lbl is not None:
-            new_tracks[tid] = cluster_to_dets[best_lbl]
+            new_tracks[tid] = clusters[best_lbl]
 
-    contiguous_tracks = {}
+    # reassign contiguous IDs
+    final: Dict[str, List[Dict[str, Any]]] = {}
     for new_id, dets in enumerate(new_tracks.values()):
         for d in dets:
-            d["det"] = new_id  # Optional: update detection's internal track label
-        contiguous_tracks[str(new_id)] = dets
+            d["det"] = new_id
+        final[str(new_id)] = dets
 
-    with open(OUTPUT_JSON, "w") as f:
-        json.dump(contiguous_tracks, f, indent=2)
+    with open(output_json, 'w') as f:
+        json.dump(final, f, indent=2)
 
-    print(f"\nSaved cleaned tracks to {OUTPUT_JSON}")
-    print(f"Final track count: {len(contiguous_tracks)}")
-    print(f"Found {len(flagged)} tracks with multiple clusters:")
-    for tid, n_clusters, num_pts in flagged:
-        print(f" • Track {tid:>4}: {n_clusters} clusters, {num_pts} downsampled points")
+    print(f"✅ clean_and_flag_tracks wrote {output_json}")
+    if flagged:
+        print(f"Flagged {len(flagged)} tracks with multiple clusters:")
+        for tid, n, pts in flagged:
+            print(f" • Track {tid}: {n} clusters, {pts} points")
 
-if __name__ == "__main__":
-    main()
+    return output_json
+
+# No CLI; import and call run() from your pipeline

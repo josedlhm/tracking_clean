@@ -1,102 +1,77 @@
-#!/usr/bin/env python3
+from pathlib import Path
 import json
 import numpy as np
-from pathlib import Path
-from scipy.spatial.transform import Rotation as SciRot
+from typing import List, Dict, Any
+from track_utils import load_poses, rotation_matrix_to_angle_axis
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
-TRACKS_JSON = Path("output/tracks_cleaned.json")
-POSES_TXT = Path("data/poses/poses_mm_yup.txt")  # camera-to-world
-OUT_DIR = Path("output/ceres_input/")
-OUT_DIR.mkdir(exist_ok=True)
 
-CAMERAS_TXT = OUT_DIR / "cameras.txt"
-POINTS_TXT = OUT_DIR / "points.txt"
-OBSERVATIONS_TXT = OUT_DIR / "observations.txt"
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-def load_camera_extrinsics(path):
-    Ts = []
-    with open(path, 'r') as f:
-        for line in f:
-            vals = list(map(float, line.strip().split()))
-            R = np.array([
-                vals[0:3],
-                vals[4:7],
-                vals[8:11]
-            ])
-            t = np.array([vals[3], vals[7], vals[11]])
-            T = np.eye(4)
-            T[:3, :3] = R
-            T[:3, 3] = t
-            Ts.append(T)
-    return Ts
+def run(
+    tracks_json: Path,
+    poses_txt:    Path,
+    out_dir:      Path     = Path("output/ceres_input"),
+) -> Path:
+    """
+    Prepare Ceres solver input files (cameras.txt, points.txt, observations.txt)
+    from cleaned tracks and camera poses.
+    Returns the out_dir path.
+    """
+    out_dir.mkdir(exist_ok=True, parents=True)
+    cameras_txt = out_dir / "cameras.txt"
+    points_txt = out_dir / "points.txt"
+    observations_txt = out_dir / "observations.txt"
 
-def rotation_matrix_to_angle_axis(R):
-    return SciRot.from_matrix(R).as_rotvec()
+    # load tracks
+    with open(tracks_json, 'r') as f:
+        tracks: Dict[str, List[Dict[str, Any]]] = json.load(f)
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
-def main():
-    with open(TRACKS_JSON) as f:
-        tracks = json.load(f)
+    # load extrinsics (camera-to-world)
+    poses_c2w = load_poses(poses_txt)
+    # convert to world-to-camera
+    poses_w2c = [np.linalg.inv(T) for T in poses_c2w]
 
-    # Load camera-to-world and convert to world-to-camera
-    poses_c2w = load_camera_extrinsics(POSES_TXT)
-    poses_w2c = []
-    for T_c2w in poses_c2w:
-        T_w2c = np.linalg.inv(T_c2w)
-        poses_w2c.append(T_w2c)
-
-    bundle_data = []
-
-    for track_id, detections in tracks.items():
+    bundle = []  # point observations
+    for track_id, dets in tracks.items():
         centroids = []
         observations = []
-
-        for det in detections:
+        for det in dets:
             if "centroid_3d" not in det:
                 continue
             centroids.append(det["centroid_3d"])
-
-            x1, y1, x2, y2 = det["bbox"]
+            x1,y1,x2,y2 = det["bbox"]
             u = (x1 + x2) / 2
             v = (y1 + y2) / 2
-
-            observations.append({
-                "frame": det["frame"],
-                "uv": [u, v]
-            })
-
+            observations.append({"frame": det["frame"], "uv": [u, v]})
         if not centroids or not observations:
             continue
+        mean_xyz = np.mean(np.array(centroids), axis=0).tolist()
+        bundle.append({"point_id": int(track_id),
+                       "xyz": mean_xyz,
+                       "observations": observations})
 
-        centroid_mean = np.mean(np.array(centroids), axis=0)
-        bundle_data.append({
-            "point_id": int(track_id),
-            "xyz": centroid_mean.tolist(),
-            "observations": observations
-        })
-
-    # ─── Write Ceres-Compatible Files ─────────────────────────────────────────
-    with open(CAMERAS_TXT, "w") as f:
+    # write cameras
+    with open(cameras_txt, 'w') as f_cam:
         for T in poses_w2c:
-            R = T[:3, :3]
-            t = T[:3, 3]
+            R = T[:3,:3]
+            t = T[:3,3]
             aa = rotation_matrix_to_angle_axis(R)
-            f.write(" ".join(map(str, list(aa) + list(t))) + "\n")
+            vec = list(aa) + list(t)
+            f_cam.write(" ".join(map(str, vec)) + "\n")
 
-    with open(POINTS_TXT, "w") as f:
-        for item in bundle_data:
-            f.write(" ".join(map(str, item["xyz"])) + "\n")
+    # write points
+    with open(points_txt, 'w') as f_pts:
+        for item in bundle:
+            f_pts.write(" ".join(map(str, item["xyz"])) + "\n")
 
-    with open(OBSERVATIONS_TXT, "w") as f:
-        for i, item in enumerate(bundle_data):
+    # write observations
+    with open(observations_txt, 'w') as f_obs:
+        for pid, item in enumerate(bundle):
             for obs in item["observations"]:
                 frame = obs["frame"]
-                u, v = obs["uv"]
-                f.write(f"{frame} {i} {u} {v}\n")
+                u,v = obs["uv"]
+                f_obs.write(f"{frame} {pid} {u} {v}\n")
 
-    print(f"✅ Wrote Ceres input files to {OUT_DIR}/")
+    print(f"✅ prepare_ceres_input wrote files to {out_dir}")
+    return out_dir
 
-if __name__ == "__main__":
-    main()
+# No CLI; import and call run() from your pipeline module
