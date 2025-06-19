@@ -7,6 +7,8 @@ Reusable helper functions for the 3D fruit-tracking pipeline.
 import numpy as np
 from sklearn.cluster import DBSCAN
 from scipy.spatial.transform import Rotation as SciRot
+import cv2
+from pathlib import Path
 
 
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
@@ -188,3 +190,76 @@ def project_cloud_to_mask(cloud, H, W):
     m = np.zeros((H,W), dtype=np.uint8)
     m[v[inside], u[inside]] = 1
     return m
+
+def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """Intersection-over-union of two boolean masks."""
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    return float(inter) / union if union > 0 else 0.0
+
+def draw_sphere_mask(u: float, v: float, z: float,
+                     radius_mm: float,
+                     H: int, W: int,
+                     fx: float, fy: float,
+                     cx: float, cy: float) -> np.ndarray:
+    """
+    Draw a filled circle of physical radius `radius_mm` at image
+    position (u,v) given depth z, returns a bool mask of size H×W.
+    """
+    from cv2 import circle
+    mask = np.zeros((H, W), np.uint8)
+    r_px = int(round(fx * radius_mm / z))
+    circle(mask, (int(round(u)), int(round(v))), r_px, 255, -1)
+    return mask > 0
+
+def convert_ceres_poses(
+    refined_cameras_path: Path,
+    output_poses_path: Path
+) -> int:
+    """
+    Read a Ceres `refined_cameras.txt` (angle-axis rx ry rz, tx ty tz per line)
+    and write out a camera-to-world 3×4 row-major file at `output_poses_path`.
+    Returns the number of poses written.
+
+    Each input line has 6 floats:
+      [rx, ry, rz, tx, ty, tz]
+    where (rx,ry,rz) is the angle-axis rotation of world→camera,
+    and (tx,ty,tz) is the translation in the camera frame.
+
+    The output row is:
+      [R_cw | t_cw] = [R_wcᵀ | –R_wcᵀ·tvec]
+    laid out as
+      r11 r12 r13  tx   r21 r22 r23  ty   r31 r32 r33  tz
+    """
+    rows = []
+    with open(refined_cameras_path, 'r') as f:
+        for ln, line in enumerate(f, 1):
+            vals = list(map(float, line.split()))
+            if len(vals) != 6:
+                raise ValueError(f"Line {ln}: expected 6 values, got {len(vals)}")
+
+            # split into angle-axis and translation
+            rvec = np.array(vals[:3], dtype=float)
+            tvec = np.array(vals[3:], dtype=float).reshape(3, 1)
+
+            # world→camera rotation matrix
+            R_wc, _ = cv2.Rodrigues(rvec)
+            # invert to get camera→world
+            R_cw = R_wc.T
+            t_cw = -R_cw @ tvec
+
+            # flatten into one row
+            row = np.hstack([
+                R_cw[0], [t_cw[0,0]],
+                R_cw[1], [t_cw[1,0]],
+                R_cw[2], [t_cw[2,0]],
+            ])
+            rows.append(row)
+
+    # write out as 12 numbers per line
+    output_poses_path.parent.mkdir(exist_ok=True, parents=True)
+    with open(output_poses_path, 'w') as f:
+        for r in rows:
+            f.write(" ".join(f"{x:.6f}" for x in r) + "\n")
+
+    return len(rows)

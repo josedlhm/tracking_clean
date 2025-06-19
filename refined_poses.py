@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import cv2
 
-IN_TXT  = Path("output/ceres_output/refined_cameras.txt")        # output of bundle adjustment
+IN_TXT  = Path("outpu/ceres/refined_cameras.txt")        # output of bundle adjustment
 OUT_TXT = Path("output/refined_poses_mm_yup.txt")   # matches poses_mm_yup.txt
 
 rows = []
