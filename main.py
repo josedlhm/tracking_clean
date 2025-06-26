@@ -48,50 +48,50 @@ def pipeline(
     )
 
     # 2) clean & flag
-    cleaned_json = clean_tracks(
-        tracks_json=tracks_json,
-        poses_file=poses_file,
-        output_json=output_dir / "tracks_cleaned.json",
-        voxel_size=VOXEL_SIZE,
-        eps=DBSCAN_EPS,
-        min_samples=DBSCAN_SAMPLES
-    )
+#     cleaned_json = clean_tracks(
+#         tracks_json=tracks_json,
+#         poses_file=poses_file,
+#         output_json=output_dir / "tracks_cleaned.json",
+#         voxel_size=VOXEL_SIZE,
+#         eps=DBSCAN_EPS,
+#         min_samples=DBSCAN_SAMPLES
+#     )
 
 
-    # 3) prepare Ceres inputs
-    ceres_dir = output_dir/"ceres"
-    prepare_ceres(
-        tracks_json=cleaned_json,
-        poses_txt=poses_file,
-        out_dir=ceres_dir
-    )
+#     # 3) prepare Ceres inputs
+#     ceres_dir = output_dir/"ceres"
+#     prepare_ceres(
+#         tracks_json=cleaned_json,
+#         poses_txt=poses_file,
+#         out_dir=ceres_dir
+#     )
 
 
-    # 4) run Ceres bundle-adjustment
-    refined_cams = ceres_dir/"refined_cameras.txt"
-    subprocess.run(
-    [
-        str(CERES_SOLVER_BIN),
-        "cameras.txt",
-        "points.txt",
-        "observations.txt",
-        # optionally: str(d_mm) if you want to override the default 150.0
-    ],
-    cwd=str(ceres_dir),
-    check=True
-)
-    print(f"✅ Ceres BA finished. Refined cameras at {ceres_dir/'refined_cameras.txt'}")
+#     # 4) run Ceres bundle-adjustment
+#     refined_cams = ceres_dir/"refined_cameras.txt"
+#     subprocess.run(
+#     [
+#         str(CERES_SOLVER_BIN),
+#         "cameras.txt",
+#         "points.txt",
+#         "observations.txt",
+#         # optionally: str(d_mm) if you want to override the default 150.0
+#     ],
+#     cwd=str(ceres_dir),
+#     check=True
+# )
+#     print(f"✅ Ceres BA finished. Refined cameras at {ceres_dir/'refined_cameras.txt'}")
 
-    # 5) deduplicate (conversion happens inside run())
-    merged = deduplicate(
-        tracks_json=cleaned_json,
-        ceres_poses=refined_cams,
-        converted_ceres_poses=poses_file.with_name("refined_poses_mm_yup.txt"),
-        ceres_points=ceres_dir/"refined_points.txt",
-        output_json=output_dir/"merged_tracks.json"
-    )
+#     # 5) deduplicate (conversion happens inside run())
+#     merged = deduplicate(
+#         tracks_json=cleaned_json,
+#         ceres_poses=refined_cams,
+#         converted_ceres_poses=poses_file.with_name("refined_poses_mm_yup.txt"),
+#         ceres_points=ceres_dir/"refined_points.txt",
+#         output_json=output_dir/"merged_tracks.json"
+#     )
 
-    return merged
+#     return merged
 
 if __name__ == "__main__":
     # Define input paths here (no CLI for now)

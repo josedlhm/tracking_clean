@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+track_and_match_masks.py
+Build 3D tracks from per-pixel mask detections + depth.
+"""
+
 from pathlib import Path
 import json
 import numpy as np
@@ -7,52 +13,47 @@ from scipy.optimize import linear_sum_assignment
 
 from track_utils import (
     load_poses, invert_T,
-    backproject_bbox_dense, filter_highest_density_cluster,
-    reject_outliers_by_mode_z, bbox_to_mask,
-    compute_iou, transform_cam_to_world, project_cloud_to_mask
+    backproject_mask_dense, backproject_pixels,expand_mask_to_frame,
+    filter_highest_density_cluster,
+    reject_outliers_by_mode_z, compute_iou,
+    transform_cam_to_world, project_cloud_to_mask
 )
 
 @dataclass
 class Detection:
     frame: int
     det_id: int
-    bbox: List[int]
     mask_coords: List[List[int]]      = field(default_factory=list)
     mask_points_3d: List[List[float]] = field(default_factory=list)
     centroid_3d: Optional[List[float]] = None
 
-
-def _get_cloud(frame_idx: int,
-               bb: List[float],
-               depth_dir: Path,
-               outlier_delta: float) -> np.ndarray:
+def _get_cloud_from_mask(frame_idx: int,
+                         mask: np.ndarray,
+                         depth_dir: Path,
+                         outlier_delta: float) -> np.ndarray:
     """
-    Load depth for a frame, back-project bbox, cluster, and reject outliers.
+    Load depth for frame_idx, back-project all pixels under 'mask',
+    cluster densest mode, and reject Z outliers.
     """
     depth = np.load(str(depth_dir / f"depth_{frame_idx:06d}.npy"))
-    dense = backproject_bbox_dense(bb, depth)
-    cluster = filter_highest_density_cluster(dense)
-    return reject_outliers_by_mode_z(cluster, delta=outlier_delta)
+    pts_cam = backproject_mask_dense(mask, depth, outlier_delta)
+    return pts_cam
 
-
-def _build_cost_matrix(masks0: List[np.ndarray],
-                       bbs1: List[List[float]],
-                       frame1: int,
-                       depth_dir: Path,
-                       iou_thresh: float) -> np.ndarray:
+def _build_cost_matrix(
+    masks0: List[np.ndarray],
+    masks1: List[np.ndarray],
+    iou_thresh: float
+) -> np.ndarray:
     """
-    Compute the Hungarian cost matrix for matching masks0 -> bbox-based ground truth.
+    Compute the Hungarian cost matrix for matching projected masks0 -> masks1.
     """
-    depth = np.load(str(depth_dir / f"depth_{frame1:06d}.npy"))
-    H, W  = depth.shape
-    gt_masks = [bbox_to_mask(bb, H, W) for bb in bbs1]
-
-    C = np.array([[1.0 - compute_iou(m0, gm) for gm in gt_masks]
-                  for m0 in masks0])
+    C = np.array([
+        [1.0 - compute_iou(m0, m1) for m1 in masks1]
+        for m0 in masks0
+    ])
     n = C.shape[0]
     pad = np.full((n, n), 1.0 - iou_thresh)
     return np.hstack([C, pad])
-
 
 def run(
     detections_json: Path,
@@ -71,7 +72,7 @@ def run(
     cy:               float
 ) -> Path:
     """
-    Build 3D tracks from 2D detections + depth.
+    Build 3D tracks from mask detections + depth.
     Writes results to output_json.
     """
     # patch intrinsics into track_utils
@@ -89,82 +90,105 @@ def run(
     prev_map = {}
 
     for frame in range(N - 1):
-        key0, key1 = f"img_{frame:06d}.png", f"img_{frame+1:06d}.png"
+        key0 = f"img_{frame:06d}.png"
+        key1 = f"img_{frame+1:06d}.png"
         if key0 not in dets or key1 not in dets:
             prev_map = {}
             continue
 
-        bbs0 = [o["bbox"] for o in dets[key0]]
-        bbs1 = [o["bbox"] for o in dets[key1]]
+        # 1) load detection masks for both frames
+        depth0 = np.load(str(depth_dir / f"depth_{frame:06d}.npy"))
+        H0, W0 = depth0.shape
         depth1 = np.load(str(depth_dir / f"depth_{frame+1:06d}.npy"))
         H1, W1 = depth1.shape
 
-        # get filtered clouds
-        clouds0 = [_get_cloud(frame,   bb, depth_dir, outlier_delta) for bb in bbs0]
-        clouds1 = [_get_cloud(frame+1, bb, depth_dir, outlier_delta) for bb in bbs1]
+        # expand each small mask to full-frame
+        det_masks0 = [
+            expand_mask_to_frame(np.array(o["mask"], dtype=bool),
+                                o["bbox"], H0, W0)
+            for o in dets[key0]
+        ]
+        det_masks1 = [
+            expand_mask_to_frame(np.array(o["mask"], dtype=bool),
+                                o["bbox"], H1, W1)
+            for o in dets[key1]
+]
 
-        # relative pose
+        # 2) back-project each detection mask into 3D clouds
+        clouds0 = [
+            _get_cloud_from_mask(frame,   mask, depth_dir, outlier_delta)
+            for mask in det_masks0
+        ]
+        clouds1 = [
+            _get_cloud_from_mask(frame+1, mask, depth_dir, outlier_delta)
+            for mask in det_masks1
+        ]
+
+        # 3) compute relative pose and project clouds0 into frame+1
         Trel = invert_T(poses[frame+1]) @ poses[frame]
         Rrel, trel = Trel[:3, :3], Trel[:3, 3]
+        depth1 = np.load(str(depth_dir / f"depth_{frame+1:06d}.npy"))
+        H1, W1 = depth1.shape
 
-        # project clouds
-        masks0 = [project_cloud_to_mask((Rrel @ c.T).T + trel, H1, W1)
-                  for c in clouds0]
+        proj_masks0 = [
+            project_cloud_to_mask((Rrel @ c.T).T + trel, H1, W1)
+            for c in clouds0
+        ]
 
-        # matching
-        Cfull = _build_cost_matrix(masks0, bbs1, frame+1,
-                                   depth_dir, iou_thresh)
+        # 4) match projected_masks0 -> det_masks1 via IoU
+        Cfull = _build_cost_matrix(proj_masks0, det_masks1, iou_thresh)
         rows, cols = linear_sum_assignment(Cfull)
         new_map, matched = {}, set()
 
-        # assign and enrich
         for i, j in zip(rows, cols):
-            if j < len(bbs1) and Cfull[i, j] <= (1.0 - iou_thresh):
+            # only accept matches below cost threshold
+            if j < len(det_masks1) and Cfull[i, j] <= (1.0 - iou_thresh):
+                # assign or start a track
                 tid = prev_map.get(i, next_id)
                 if i not in prev_map:
-                    next_id += 1
+                    # new track
                     tracks[tid] = []
+                    next_id += 1
+                    # record first detection (frame)
                     pts0 = (transform_cam_to_world(clouds0[i], poses[frame])
                             if clouds0[i].size else np.empty((0, 3)))
                     cent0 = pts0.mean(axis=0).tolist() if pts0.size else None
-                    mask0 = project_cloud_to_mask(clouds0[i], H1, W1)
-                    coords0 = [[int(x), int(y)] for y, x in zip(*np.where(mask0))]
+                    ys, xs = np.where(det_masks0[i])
+                    coords0 = np.column_stack((xs, ys)).tolist()
                     tracks[tid].append(
-                        Detection(frame, i, list(map(int, bbs0[i])),
-                                  coords0, pts0.tolist(), cent0)
+                        Detection(frame, i, coords0, pts0.tolist(), cent0)
                     )
 
+                # record matched detection (frame+1)
                 pts1 = (transform_cam_to_world(clouds1[j], poses[frame+1])
                         if clouds1[j].size else np.empty((0, 3)))
                 cent1 = pts1.mean(axis=0).tolist() if pts1.size else None
-                mask1 = project_cloud_to_mask(clouds1[j], H1, W1)
-                coords1 = [[int(x), int(y)] for y, x in zip(*np.where(mask1))]
+                ys, xs = np.where(det_masks1[j])
+                coords1 = np.column_stack((xs, ys)).tolist()
                 tracks[tid].append(
-                    Detection(frame+1, j, list(map(int, bbs1[j])),
-                              coords1, pts1.tolist(), cent1)
+                    Detection(frame+1, j, coords1, pts1.tolist(), cent1)
                 )
 
-                new_map[j] = tid
+                new_map[i] = tid
                 matched.add(j)
 
-        # new tracks for unmatched
-        for j in set(range(len(bbs1))) - matched:
+        # 5) any unmatched detections in frame+1 start new tracks
+        for j in set(range(len(det_masks1))) - matched:
             tid = next_id
             next_id += 1
             pts1 = (transform_cam_to_world(clouds1[j], poses[frame+1])
                     if clouds1[j].size else np.empty((0, 3)))
             cent1 = pts1.mean(axis=0).tolist() if pts1.size else None
-            mask1 = project_cloud_to_mask(clouds1[j], H1, W1)
-            coords1 = [[int(x), int(y)] for y, x in zip(*np.where(mask1))]
+            coords1 = [[int(x), int(y)]
+                       for y, x in zip(*np.where(det_masks1[j]))]
             tracks[tid] = [
-                Detection(frame+1, j, list(map(int, bbs1[j])),
-                          coords1, pts1.tolist(), cent1)
+                Detection(frame+1, j, coords1, pts1.tolist(), cent1)
             ]
             new_map[j] = tid
 
         prev_map = new_map
 
-    # final pruning
+    # 6) final pruning & write out
     final = {}
     new_id = 0
     for tid, dets_list in tracks.items():
@@ -174,12 +198,13 @@ def run(
             for d in dets_list:
                 d.det_id = new_id
             final[new_id] = [
-                {"frame": d.frame,
-                 "det":   d.det_id,
-                 "bbox":  d.bbox,
-                 "mask_coords": d.mask_coords,
-                 "mask_points_3d": d.mask_points_3d,
-                 "centroid_3d":   d.centroid_3d}
+                {
+                  "frame": d.frame,
+                  "det":   d.det_id,
+                  "mask_coords":      d.mask_coords,
+                  "mask_points_3d":   d.mask_points_3d,
+                  "centroid_3d":      d.centroid_3d
+                }
                 for d in dets_list
             ]
             new_id += 1
@@ -188,6 +213,5 @@ def run(
         json.dump(final, f, indent=2)
 
     print(f"Total tracks: {len(final)}")
-    print(f"✅ new_tracks wrote {output_json}")
+    print(f"✅ wrote {output_json}")
     return output_json
-

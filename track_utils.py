@@ -9,6 +9,9 @@ from sklearn.cluster import DBSCAN
 from scipy.spatial.transform import Rotation as SciRot
 import cv2
 from pathlib import Path
+from typing import List, Optional
+
+
 
 
 def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
@@ -150,6 +153,53 @@ def backproject_bbox_dense(bbox, depth):
     Y = -(yg - CY) * zg / FY
     return np.stack([X, Y, zg], axis=1)
 
+def backproject_pixels(xs: np.ndarray,
+                       ys: np.ndarray,
+                       zs: np.ndarray) -> np.ndarray:
+    """
+    xs, ys: 1D arrays of image‐space coords
+    zs:      1D array of depths at those pixels
+    returns: (N,3) array of points in the camera frame
+    """
+    # pinhole model inversion
+    X = (xs - CX) * zs / FX
+    Y = -(ys - CY) * zs / FY
+    return np.stack([X, Y, zs], axis=1)
+def backproject_mask_dense(mask: np.ndarray,
+                           depth: np.ndarray,
+                           outlier_delta: float) -> np.ndarray:
+    """
+    Given a binary mask and per-pixel depth map, back-project
+    all valid masked pixels into camera space, cluster the densest
+    component, and reject Z outliers.
+    """
+    # find all masked pixels
+    ys, xs = np.where(mask)
+    if xs.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    # depths at those pixels
+    zs = depth[ys, xs].astype(np.float32)
+
+    # filter out invalid depths
+    valid = (zs > 0) & np.isfinite(zs)
+    if not np.any(valid):
+        return np.zeros((0, 3), dtype=np.float32)
+
+    xs, ys, zs = xs[valid], ys[valid], zs[valid]
+
+    # back-project valid pixels
+    pts_cam = backproject_pixels(xs, ys, zs)
+
+    # drop any residual NaNs/infs just in case
+    finite_mask = np.all(np.isfinite(pts_cam), axis=1)
+    pts_cam = pts_cam[finite_mask]
+
+    # cluster densest and reject outliers by Z-mode
+    cluster = filter_highest_density_cluster(pts_cam)
+    return reject_outliers_by_mode_z(cluster, delta=outlier_delta)
+
+
 def filter_highest_density_cluster(points, eps=2, min_samples=10):
     if len(points) < min_samples:
         return points
@@ -263,3 +313,20 @@ def convert_ceres_poses(
             f.write(" ".join(f"{x:.6f}" for x in r) + "\n")
 
     return len(rows)
+
+def expand_mask_to_frame(small_mask: np.ndarray,
+                         bbox: List[int],
+                         H: int, W: int) -> np.ndarray:
+    """
+    Given a small_mask of shape (y2-y1+1, x2-x1+1) and its bbox [x1,y1,x2,y2],
+    embed it into a full-size H×W boolean array.
+    """
+    x1, y1, x2, y2 = bbox
+    # ensure integer coords
+    x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+    full = np.zeros((H, W), dtype=bool)
+    # clamp to image
+    x2c = min(W, x2+1)
+    y2c = min(H, y2+1)
+    full[y1:y2c, x1:x2c] = small_mask[:(y2c-y1), :(x2c-x1)]
+    return full
